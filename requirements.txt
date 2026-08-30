@@ -1,0 +1,32 @@
+# Python dependencies for AI Bot Platform
+# Install with: pip install -r requirements.txt
+
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Telegram
+telethon
+
+# WhatsApp Web Automation (replaces Meta Cloud API)
+neonize
+qrcode
+Pillow
+
+# Database
+supabase
+
+# Session encryption (Telegram/WhatsApp session storage)
+cryptography
+
+# Signed session tokens (real login sessions, not client-asserted user_id)
+itsdangerous
+
+# Environment variables
+python-dotenv
+
+# HTTP client
+httpx
+
+# Data validation
+pydantic
