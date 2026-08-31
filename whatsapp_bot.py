@@ -45,6 +45,38 @@ logging.getLogger("neonize").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 
+# ─────────────────────────────────────────────────────────────────────────
+# 🌐 Minimal health-check HTTP server (Render / uptime-pinger friendly)
+# ─────────────────────────────────────────────────────────────────────────
+# Same purpose and design as the one in auto_reply_bot.py — see that file
+# for the full explanation. Completely separate from the WhatsApp bot's
+# own polling logic below; stdlib only (http.server), no new dependency.
+import http.server
+
+_HEALTH_PORT = int(os.getenv('PORT', 8082))  # Render injects PORT; 8082 is just the local fallback
+                                              # (different default than auto_reply_bot.py's 8081 so
+                                              #  both can run side-by-side locally without colliding)
+
+
+class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK - whatsapp bot running')
+
+    def log_message(self, format, *args):
+        pass  # don't spam the bot's console with per-ping access logs
+
+
+def _start_health_check_server() -> None:
+    server = http.server.HTTPServer(('0.0.0.0', _HEALTH_PORT), _HealthCheckHandler)
+    print(f"🌐 Health-check server listening on 0.0.0.0:{_HEALTH_PORT}")
+    server.serve_forever()
+
+
+threading.Thread(target=_start_health_check_server, daemon=True, name="health-check").start()
+
 supabase: Client = create_client(
     os.getenv('SUPABASE_URL'),
     os.getenv('SUPABASE_KEY')
