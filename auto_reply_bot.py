@@ -3,8 +3,9 @@ from telethon.sessions import StringSession
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import os
-import asyncio 
+import asyncio
 import re
+from datetime import datetime, timezone
 
 import threading
 
@@ -53,6 +54,19 @@ def _start_health_check_server() -> None:
 
 
 threading.Thread(target=_start_health_check_server, daemon=True, name="health-check").start()
+
+# ─────────────────────────────────────────────────────────────────────────
+# 🕒 Stale-message guard (Flush Pending Updates)
+# ─────────────────────────────────────────────────────────────────────────
+# Records the moment THIS process came up. Any message whose own send
+# timestamp is from before this moment was queued up by Telegram while
+# the bot was offline (manual replies, downtime, etc.) — and Telethon
+# will hand ALL of those to the handler in a burst the instant it
+# reconnects. Combined with the 30-second freshness check inside
+# handle_message(), this stops the "wakes up and blasts replies to
+# everyone who messaged while I was away" behavior.
+PROCESS_START_TIME = datetime.now(timezone.utc)
+MAX_MESSAGE_AGE_SECONDS = 30
 
 supabase: Client = create_client(
     os.getenv('SUPABASE_URL'),
@@ -244,7 +258,18 @@ def make_handler(bot_record):
     except (ValueError, TypeError):
         print(f"[Bot {phone}] ✗ Invalid API ID: {api_id!r}")
         return None
-    client = TelegramClient(StringSession(session_string), api_id_int, str(api_hash).strip())
+    # ── FIX 10: catch_up=False (Telethon's closest equivalent to
+    # "drop_pending_updates") tells Telethon not to proactively fetch the
+    # update backlog via getDifference on reconnect. Note this is a
+    # secondary hardening measure, NOT the main fix — Telegram can still
+    # push queued messages as normal incoming updates the instant the
+    # connection re-opens regardless of this flag, which is exactly why
+    # the timestamp filter in handle_message() above is what actually
+    # stops the burst-reply behavior.
+    client = TelegramClient(
+        StringSession(session_string), api_id_int, str(api_hash).strip(),
+        catch_up=False,
+    )
 
     if bot_id not in user_states:
         user_states[bot_id] = {}
@@ -253,6 +278,22 @@ def make_handler(bot_record):
     async def handle_message(event):
         # ── FIX 2: Private messages ONLY — ignore all groups ───────
         if not event.is_private:
+            return
+
+        # ── FIX 9: Stale-message guard (Timestamp Filter) ──────────
+        # event.message.date is timezone-aware UTC — exactly when Telegram's
+        # servers received the message, not when we happen to process it.
+        # Skip anything sent before this bot process started, OR anything
+        # older than MAX_MESSAGE_AGE_SECONDS — this is what stops a burst
+        # of hours-old messages (queued while the bot was stopped/offline)
+        # from all getting auto-replies the moment the bot reconnects.
+        msg_time = event.message.date
+        if msg_time < PROCESS_START_TIME:
+            print(f"[Bot {phone}] ⏭ skipping message from before bot start ({msg_time.isoformat()})")
+            return
+        age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
+        if age_seconds > MAX_MESSAGE_AGE_SECONDS:
+            print(f"[Bot {phone}] ⏭ skipping stale message ({age_seconds:.0f}s old)")
             return
 
         # ── FIX 5: sender can legitimately be None (deleted account,
