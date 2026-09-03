@@ -27,6 +27,7 @@ import re
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 from typing import Optional
 
 from neonize import NewClient
@@ -76,6 +77,20 @@ def _start_health_check_server() -> None:
 
 
 threading.Thread(target=_start_health_check_server, daemon=True, name="health-check").start()
+
+# ─────────────────────────────────────────────────────────────────────────
+# 🕒 Stale-message guard (Flush Pending Updates)
+# ─────────────────────────────────────────────────────────────────────────
+# Same purpose as the matching guard in auto_reply_bot.py: WhatsApp (via
+# whatsmeow) delivers messages received while you were offline the moment
+# the connection re-opens — that's inherent to how WhatsApp keeps devices
+# in sync and isn't something a client-side flag can turn off. So instead
+# of trying to suppress delivery, we check each message's own timestamp
+# and skip anything from before this process started / older than
+# MAX_MESSAGE_AGE_SECONDS — see _get_message_timestamp() and its use in
+# handle_message_async() below.
+PROCESS_START_TIME = datetime.now(timezone.utc)
+MAX_MESSAGE_AGE_SECONDS = 30
 
 supabase: Client = create_client(
     os.getenv('SUPABASE_URL'),
@@ -192,6 +207,45 @@ def _get_reply_jid(msg: MessageEv) -> Optional[JID]:
         return msg.Info.MessageSource.Sender
     except Exception:
         return None
+
+
+def _get_message_timestamp(msg: MessageEv):
+    """
+    Best-effort extraction of msg.Info.Timestamp (when WhatsApp says the
+    message was actually sent) as a timezone-aware UTC datetime.
+
+    ⚠️ neonize wraps whatsmeow's Go struct via protobuf/FFI, and its exact
+    Python shape for this field isn't pinned down in the docs — this tries
+    the shapes protobuf timestamps commonly take (a `google.protobuf.
+    Timestamp`-like object, a raw int/float epoch, or an already-built
+    datetime) and returns None if nothing matches, rather than guessing
+    wrong. handle_message_async() treats None as "can't verify age, don't
+    drop it" so a parsing miss fails safe instead of silently eating live
+    messages.
+
+    IMPORTANT: check the printed message age in your logs after deploying
+    — if you see "could not read message timestamp" instead of an age in
+    seconds, the field shape differs from what's handled here and this
+    needs a one-line adjustment for your installed neonize version.
+    """
+    try:
+        ts = msg.Info.Timestamp
+    except Exception:
+        return None
+
+    try:
+        if hasattr(ts, 'ToDatetime'):          # protobuf well-known Timestamp
+            return ts.ToDatetime().replace(tzinfo=timezone.utc)
+        if hasattr(ts, 'seconds'):             # protobuf Timestamp-like (.seconds/.nanos)
+            return datetime.fromtimestamp(ts.seconds, tz=timezone.utc)
+        if isinstance(ts, (int, float)):       # raw unix epoch — seconds or ms
+            ts_val = ts / 1000 if ts > 10_000_000_000 else ts
+            return datetime.fromtimestamp(ts_val, tz=timezone.utc)
+        if isinstance(ts, datetime):
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    return None
 
 
 # =============================================================================
@@ -376,6 +430,22 @@ async def handle_message_async(client: NewClient, msg: MessageEv,
     # ── 1. Private-only filter ────────────────────────────────────────────────
     if not _is_private_message(msg):
         return
+
+    # ── 1b. Stale-message guard (Timestamp Filter) ──────────────────────────
+    msg_time = _get_message_timestamp(msg)
+    if msg_time is not None:
+        if msg_time < PROCESS_START_TIME:
+            print(f"[WhatsApp] ⏭ skipping message from before bot start ({msg_time.isoformat()})")
+            return
+        age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
+        if age_seconds > MAX_MESSAGE_AGE_SECONDS:
+            print(f"[WhatsApp] ⏭ skipping stale message ({age_seconds:.0f}s old)")
+            return
+    else:
+        # See the warning in _get_message_timestamp()'s docstring — this
+        # means the timestamp field shape wasn't recognized. Doesn't block
+        # the message (fails safe), but flags that this needs a look.
+        print("[WhatsApp] ⚠ could not read message timestamp — processing anyway, see _get_message_timestamp()")
 
     sender_id = _get_sender_id(msg)
     msg_text  = _extract_text(msg).strip()
