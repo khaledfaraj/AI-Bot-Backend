@@ -21,6 +21,7 @@ Run for one user:
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -33,7 +34,7 @@ from typing import Optional
 from neonize import NewClient
 from neonize.events import ConnectedEv, MessageEv
 from neonize.proto.Neonize_pb2 import JID
-from supabase import create_client, Client
+from supabase import create_client, Client, acreate_client, AsyncClient
 from dotenv import load_dotenv
 
 from session_crypto import encrypt_bytes, decrypt_bytes_safe
@@ -60,11 +61,23 @@ _HEALTH_PORT = int(os.getenv('PORT', 8082))  # Render injects PORT; 8082 is just
 
 
 class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _write_health_response(self, include_body: bool) -> None:
+        payload = json.dumps({"status": "ok", "message": "WhatsApp bot is running"}).encode('utf-8')
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
-        self.wfile.write(b'OK - whatsapp bot running')
+        if include_body:
+            self.wfile.write(payload)
+
+    def do_GET(self):
+        self._write_health_response(include_body=True)
+
+    def do_HEAD(self):
+        # UptimeRobot and Render's own health checks sometimes use HEAD
+        # instead of GET — HTTP forbids a body on HEAD responses, so we
+        # send the same 200 + headers but skip writing the payload.
+        self._write_health_response(include_body=False)
 
     def log_message(self, format, *args):
         pass  # don't spam the bot's console with per-ping access logs
@@ -98,7 +111,9 @@ supabase: Client = create_client(
 )
 
 REPLY_DELAY   = 3   # seconds before every auto-reply
-POLL_INTERVAL = 30  # seconds between Supabase polls for new/stopped bots
+POLL_INTERVAL = 300  # seconds — now just a SAFETY NET; Supabase Realtime
+                      # (see _start_realtime_listener_async below) is the
+                      # primary, fast path for picking up newly-activated bots
 
 # Per-bot menu navigation state: {bot_id: {sender_number: 'main'|'section_1'|...}}
 user_states: dict[str, dict[str, str]] = {}
@@ -670,9 +685,106 @@ def _sync_bots() -> None:
             _stop_bot(bot_id)
 
 
+def _extract_new_record(payload: dict):
+    """
+    Supabase Realtime payloads for postgres_changes carry the changed row
+    under slightly different keys depending on client/library version
+    (seen in the wild: payload['data']['record'], payload['record'],
+    payload['new']). This tries the common shapes rather than assuming
+    one, and returns None if none match.
+    """
+    for key_path in (('data', 'record'), ('record',), ('new',), ('data', 'new')):
+        node = payload
+        try:
+            for k in key_path:
+                node = node[k]
+            if node:
+                return node
+        except (KeyError, TypeError):
+            continue
+    return None
+
+
+async def _start_realtime_listener_async() -> None:
+    """
+    Subscribes to Postgres changes on the telegram_bot table (filtered to
+    platform=whatsapp) via Supabase Realtime, so a newly-activated bot
+    starts within ~1 second instead of waiting for the next poll.
+
+    REQUIRES a one-time manual step in the Supabase dashboard: enable
+    Replication for the `telegram_bot` table (Database → Replication →
+    toggle it on), or run:
+        alter publication supabase_realtime add table telegram_bot;
+    Telegram and WhatsApp bots share this same table (filtered by the
+    `platform` column) — if you already enabled this for the Telegram
+    bot, WhatsApp is covered too, no extra step needed here.
+
+    _start_bot()/_stop_bot() in this file are plain synchronous functions
+    (this file manages bots with threads, not asyncio) — the callback
+    below calls them directly, which is safe since they're already
+    protected by _registry_lock the same way _polling_loop() uses them.
+    """
+    try:
+        realtime_client: AsyncClient = await acreate_client(
+            os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY')
+        )
+    except Exception as e:
+        print(f"⚠  Realtime listener could not start ({e}) — relying on {POLL_INTERVAL}s polling only")
+        return
+
+    async def _on_change(payload: dict) -> None:
+        try:
+            record = _extract_new_record(payload)
+            if record is None:
+                print(f"⚠  Realtime: unrecognized payload shape, ignoring: {payload!r}")
+                return
+            if record.get('platform') != 'whatsapp' or record.get('status') != 'active':
+                return
+            if not record.get('bot_name'):
+                return
+            bot_id = str(record.get('id') or '')
+            if not bot_id:
+                return
+            with _registry_lock:
+                already_running = bot_id in _registry
+            if already_running:
+                return
+            print(f"⚡ Realtime: bot {bot_id} activated — starting now")
+            _start_bot(record)  # sync function — called directly, not awaited
+        except Exception as e:
+            print(f"⚠  Realtime callback error: {e}")
+
+    channel = realtime_client.channel('whatsapp-bot-changes')
+    channel.on_postgres_changes(
+        '*', schema='public', table='telegram_bot',
+        filter='platform=eq.whatsapp',
+        callback=lambda payload: asyncio.create_task(_on_change(payload)),
+    )
+    await channel.subscribe()
+    print("📡 Realtime listener active — new WhatsApp bots will start within ~1s of activation")
+
+    # Keep this thread's own event loop alive indefinitely
+    await asyncio.Event().wait()
+
+
+def _run_realtime_listener_in_thread() -> None:
+    """
+    Runs the async Supabase Realtime listener inside its own asyncio
+    event loop, in its own background thread. Needed because the rest of
+    this file manages bots synchronously with threads, but supabase-py's
+    realtime client (acreate_client + channel.subscribe()) is async-only.
+    """
+    try:
+        asyncio.run(_start_realtime_listener_async())
+    except Exception as e:
+        print(f"⚠  Realtime listener thread crashed ({e}) — relying on {POLL_INTERVAL}s polling only")
+
+
 def _polling_loop(stop_event: threading.Event) -> None:
     """
     Background daemon thread: polls Supabase every POLL_INTERVAL seconds.
+    Now a safety net behind the realtime listener above — see
+    _start_realtime_listener_async() for the primary, fast path.
     Cleanly stoppable via stop_event.
     """
     while not stop_event.is_set():
@@ -713,11 +825,14 @@ def run_all_whatsapp_bots() -> None:
 
     print("="*42)
 
-    # Background poller
+    # Background poller (safety net)
     stop_event = threading.Event()
     poller = threading.Thread(target=_polling_loop, args=(stop_event,),
                               daemon=True, name="wa-poller")
     poller.start()
+
+    # Realtime listener (primary, fast path)
+    threading.Thread(target=_run_realtime_listener_in_thread, daemon=True, name="wa-realtime").start()
 
     try:
         threading.Event().wait()
