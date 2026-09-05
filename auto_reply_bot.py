@@ -1,10 +1,11 @@
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from supabase import create_client, Client
+from supabase import create_client, Client, acreate_client, AsyncClient
 from dotenv import load_dotenv
 import os
 import asyncio
 import re
+import json
 from datetime import datetime, timezone
 
 import threading
@@ -37,11 +38,23 @@ _HEALTH_PORT = int(os.getenv('PORT', 8081))  # Render injects PORT; 8081 is just
 
 
 class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _write_health_response(self, include_body: bool) -> None:
+        payload = json.dumps({"status": "ok", "message": "Telegram bot is running"}).encode('utf-8')
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
-        self.wfile.write(b'OK - telegram bot running')
+        if include_body:
+            self.wfile.write(payload)
+
+    def do_GET(self):
+        self._write_health_response(include_body=True)
+
+    def do_HEAD(self):
+        # UptimeRobot and Render's own health checks sometimes use HEAD
+        # instead of GET — HTTP forbids a body on HEAD responses, so we
+        # send the same 200 + headers but skip writing the payload.
+        self._write_health_response(include_body=False)
 
     def log_message(self, format, *args):
         pass  # don't spam the bot's console with per-ping access logs
@@ -77,7 +90,11 @@ supabase: Client = create_client(
 user_states = {}
 
 REPLY_DELAY   = 3   # seconds before every auto-reply
-POLL_INTERVAL = 30  # seconds between Supabase polls for new/stopped bots
+POLL_INTERVAL = 300  # seconds — now just a SAFETY NET; Supabase Realtime
+                      # (below) is what actually starts newly-activated bots
+                      # within ~1 second. If a realtime event is ever missed
+                      # (brief network drop, etc.), this catches it within
+                      # 5 minutes worst case instead of leaving a bot dead.
 
 # =============================================================================
 # Bot Registry  — tracks every running Telethon client
@@ -544,6 +561,8 @@ async def _polling_loop() -> None:
     """
     Async background task: polls Supabase every POLL_INTERVAL seconds.
     Runs inside the main asyncio event loop alongside all active bots.
+    Now a safety net behind the realtime listener — see
+    _start_realtime_listener() below for the primary, fast path.
     """
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -552,6 +571,83 @@ async def _polling_loop() -> None:
             count = len(_registry)
         if count:
             print(f"  ↻  Poll: {count} bot(s) active")
+
+
+def _extract_new_record(payload: dict):
+    """
+    Supabase Realtime payloads for postgres_changes carry the changed row
+    under slightly different keys depending on client/library version
+    (seen in the wild: payload['data']['record'], payload['record'],
+    payload['new']). This tries the common shapes rather than assuming
+    one, and returns None if none match — see the warning printed in
+    _start_realtime_listener()'s callback when that happens.
+    """
+    for key_path in (('data', 'record'), ('record',), ('new',), ('data', 'new')):
+        node = payload
+        try:
+            for k in key_path:
+                node = node[k]
+            if node:
+                return node
+        except (KeyError, TypeError):
+            continue
+    return None
+
+
+async def _start_realtime_listener() -> None:
+    """
+    Subscribes to Postgres changes on the telegram_bot table (filtered to
+    platform=telegram) via Supabase Realtime, so a newly-activated bot
+    starts within ~1 second instead of waiting for the next poll.
+
+    REQUIRES a one-time manual step in the Supabase dashboard: enable
+    Replication for the `telegram_bot` table (Database → Replication →
+    toggle it on), or run:
+        alter publication supabase_realtime add table telegram_bot;
+    Nothing else in the database needs to change — same table, same rows,
+    same SUPABASE_URL/SUPABASE_KEY env vars already in use.
+
+    If this fails to connect for any reason (network hiccup, older
+    supabase-py version without acreate_client, etc.), it logs a warning
+    and the bot keeps running fine on POLL_INTERVAL polling alone —
+    this is an enhancement, not a hard dependency.
+    """
+    try:
+        realtime_client: AsyncClient = await acreate_client(
+            os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY')
+        )
+    except Exception as e:
+        print(f"⚠  Realtime listener could not start ({e}) — relying on {POLL_INTERVAL}s polling only")
+        return
+
+    async def _on_change(payload: dict) -> None:
+        try:
+            record = _extract_new_record(payload)
+            if record is None:
+                print(f"⚠  Realtime: unrecognized payload shape, ignoring: {payload!r}")
+                return
+            if record.get('platform') != 'telegram' or record.get('status') != 'active':
+                return
+            bot_id = record.get('id')
+            if not bot_id:
+                return
+            with _registry_lock:
+                already_running = bot_id in _registry
+            if already_running:
+                return
+            print(f"⚡ Realtime: bot {bot_id} activated — starting now")
+            await _start_bot(record)
+        except Exception as e:
+            print(f"⚠  Realtime callback error: {e}")
+
+    channel = realtime_client.channel('telegram-bot-changes')
+    channel.on_postgres_changes(
+        '*', schema='public', table='telegram_bot',
+        filter='platform=eq.telegram',
+        callback=lambda payload: asyncio.create_task(_on_change(payload)),
+    )
+    await channel.subscribe()
+    print("📡 Realtime listener active — new Telegram bots will start within ~1s of activation")
 
 
 # =============================================================================
@@ -572,7 +668,9 @@ async def run_all_bots() -> None:
 
     print("=" * 55)
 
-    # Launch background poller as a concurrent async task
+    # Launch the realtime listener (fast path) and the polling loop
+    # (safety net) as concurrent background tasks.
+    asyncio.create_task(_start_realtime_listener())
     asyncio.create_task(_polling_loop())
 
     # Keep the event loop alive indefinitely
