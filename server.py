@@ -49,6 +49,15 @@ from neonize import NewClient
 from neonize.events import ConnectedEv, MessageEv
 from neonize.proto.Neonize_pb2 import JID
 
+# The Telegram and WhatsApp bot managers — previously run as separate
+# standalone processes/services. Importing them here (rather than running
+# `python auto_reply_bot.py` / `python whatsapp_bot.py` separately) is what
+# lets all three live inside this one Render service. Importing them just
+# defines their functions/clients — it does NOT start anything by itself;
+# both are explicitly launched from this file's startup() event below.
+import auto_reply_bot
+import whatsapp_bot
+
 load_dotenv()
 
 app = FastAPI()
@@ -110,6 +119,31 @@ async def startup():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
     print("✅ FastAPI startup — main event loop captured.")
+
+    # ── Launch the Telegram bot manager ─────────────────────────────────
+    # run_all_bots() is a long-running async function (its own realtime
+    # listener + polling-loop safety net + per-bot Telethon clients) — it
+    # shares this same asyncio event loop as the FastAPI app itself, which
+    # is exactly what lets the API keep answering HTTP requests at the same
+    # time Telegram messages are being processed, with no manual threading
+    # needed on this side.
+    asyncio.create_task(auto_reply_bot.run_all_bots())
+    print("✅ Telegram bot manager started (asyncio task on the main loop).")
+
+    # ── Launch the WhatsApp bot manager ─────────────────────────────────
+    # run_all_whatsapp_bots() is a SYNCHRONOUS function that blocks forever
+    # (it manages its own neonize client threads internally) — it cannot
+    # share this event loop the way the Telegram manager does, so it runs
+    # in its own background thread instead. This still achieves the same
+    # goal (all three subsystems running concurrently, none blocking the
+    # others) — it just uses a thread instead of a task for this one piece,
+    # because that's what its underlying library (neonize) requires.
+    threading.Thread(
+        target=whatsapp_bot.run_all_whatsapp_bots,
+        daemon=True,
+        name="wa-manager",
+    ).start()
+    print("✅ WhatsApp bot manager started (background thread).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1077,7 +1111,7 @@ async def delete_bot(bot_id: str, current_user: dict = Depends(get_current_user)
 async def root():
     return {
         "status":                    "running",
-        "message":                   "AI Bot Backend — Telegram + WhatsApp (neonize)",
+        "message":                   "AI Bot Backend — API + Telegram + WhatsApp, merged into one service",
         "active_telegram_sessions":  len(active_sessions),
         "active_whatsapp_clients":   len(wa_clients),
         "supabase_connected":        supabase is not None,
@@ -1086,15 +1120,27 @@ async def root():
     }
 
 
+@app.get("/health")
+async def health_check():
+    # Simple, fast, dependency-free 200 — this is what Render/UptimeRobot
+    # should be pointed at. It does not query Supabase or anything else
+    # that could be slow or momentarily down; a basic process-alive check
+    # is exactly what a health check is for.
+    return {"status": "ok", "message": "Bot is running"}
+
+
 if __name__ == '__main__':
     import uvicorn
+    # Render injects PORT and expects the app to bind to it — 5000 is only
+    # the local-dev fallback when that variable isn't set.
+    port = int(os.getenv('PORT', 5000))
     print("\n" + "="*60)
-    print("🚀 AI BOT BACKEND SERVER")
+    print("🚀 AI BOT BACKEND SERVER (API + Telegram + WhatsApp, one service)")
     print("="*60)
-    print(f"📡 Port  : 5000")
-    print(f"🔗 URL   : http://localhost:5000")
+    print(f"📡 Port  : {port}")
+    print(f"🔗 URL   : http://localhost:{port}")
     print(f"🟢 WA    : neonize (WhatsApp Web — Free)")
     print(f"💬 TG    : Telegram via Telethon")
     print(f"🔐 Auth  : Supabase username/password")
     print("="*60)
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=port)
