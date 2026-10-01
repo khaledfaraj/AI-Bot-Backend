@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import re
-import json
 from datetime import datetime, timezone
 
 import threading
@@ -19,54 +18,11 @@ import logging
 logging.getLogger("telethon").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 
-# ─────────────────────────────────────────────────────────────────────────
-# 🌐 Minimal health-check HTTP server (Render / uptime-pinger friendly)
-# ─────────────────────────────────────────────────────────────────────────
-# Render's free plan needs the process to bind an HTTP port and answer
-# requests, or it's treated as crashed and gets restarted. This does NOT
-# touch the bot's own polling logic below at all — it's a completely
-# separate, minimal server running in its own background thread, using
-# only the stdlib (http.server), so no new dependency is added.
-#
-# Started here (top of file, at import time) rather than inside
-# `if __name__ == '__main__':` so the port is already open and answering
-# before the (potentially slow) initial Supabase sync / Telegram logins
-# even begin — avoiding a failed health check on first boot.
-import http.server
-
-_HEALTH_PORT = int(os.getenv('PORT', 8081))  # Render injects PORT; 8081 is just the local fallback
-
-
-class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-    def _write_health_response(self, include_body: bool) -> None:
-        payload = json.dumps({"status": "ok", "message": "Telegram bot is running"}).encode('utf-8')
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        if include_body:
-            self.wfile.write(payload)
-
-    def do_GET(self):
-        self._write_health_response(include_body=True)
-
-    def do_HEAD(self):
-        # UptimeRobot and Render's own health checks sometimes use HEAD
-        # instead of GET — HTTP forbids a body on HEAD responses, so we
-        # send the same 200 + headers but skip writing the payload.
-        self._write_health_response(include_body=False)
-
-    def log_message(self, format, *args):
-        pass  # don't spam the bot's console with per-ping access logs
-
-
-def _start_health_check_server() -> None:
-    server = http.server.HTTPServer(('0.0.0.0', _HEALTH_PORT), _HealthCheckHandler)
-    print(f"🌐 Health-check server listening on 0.0.0.0:{_HEALTH_PORT}")
-    server.serve_forever()
-
-
-threading.Thread(target=_start_health_check_server, daemon=True, name="health-check").start()
+# NOTE: this file's standalone health-check HTTP server was removed here.
+# Now that this module is imported by server.py and run inside the same
+# process, server.py's own FastAPI app (and its single port / /health
+# route) is what Render pings — a second server trying to bind the same
+# $PORT from inside this module would crash with "address already in use".
 
 # ─────────────────────────────────────────────────────────────────────────
 # 🕒 Stale-message guard (Flush Pending Updates)
