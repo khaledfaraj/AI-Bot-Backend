@@ -21,7 +21,6 @@ Run for one user:
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import re
@@ -47,49 +46,11 @@ logging.getLogger("neonize").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 
-# ─────────────────────────────────────────────────────────────────────────
-# 🌐 Minimal health-check HTTP server (Render / uptime-pinger friendly)
-# ─────────────────────────────────────────────────────────────────────────
-# Same purpose and design as the one in auto_reply_bot.py — see that file
-# for the full explanation. Completely separate from the WhatsApp bot's
-# own polling logic below; stdlib only (http.server), no new dependency.
-import http.server
-
-_HEALTH_PORT = int(os.getenv('PORT', 8082))  # Render injects PORT; 8082 is just the local fallback
-                                              # (different default than auto_reply_bot.py's 8081 so
-                                              #  both can run side-by-side locally without colliding)
-
-
-class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-    def _write_health_response(self, include_body: bool) -> None:
-        payload = json.dumps({"status": "ok", "message": "WhatsApp bot is running"}).encode('utf-8')
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        if include_body:
-            self.wfile.write(payload)
-
-    def do_GET(self):
-        self._write_health_response(include_body=True)
-
-    def do_HEAD(self):
-        # UptimeRobot and Render's own health checks sometimes use HEAD
-        # instead of GET — HTTP forbids a body on HEAD responses, so we
-        # send the same 200 + headers but skip writing the payload.
-        self._write_health_response(include_body=False)
-
-    def log_message(self, format, *args):
-        pass  # don't spam the bot's console with per-ping access logs
-
-
-def _start_health_check_server() -> None:
-    server = http.server.HTTPServer(('0.0.0.0', _HEALTH_PORT), _HealthCheckHandler)
-    print(f"🌐 Health-check server listening on 0.0.0.0:{_HEALTH_PORT}")
-    server.serve_forever()
-
-
-threading.Thread(target=_start_health_check_server, daemon=True, name="health-check").start()
+# NOTE: this file's standalone health-check HTTP server was removed here.
+# Now that this module is imported by server.py and run inside the same
+# process, server.py's own FastAPI app (and its single port / /health
+# route) is what Render pings — a second server trying to bind the same
+# $PORT from inside this module would crash with "address already in use".
 
 # ─────────────────────────────────────────────────────────────────────────
 # 🕒 Stale-message guard (Flush Pending Updates)
