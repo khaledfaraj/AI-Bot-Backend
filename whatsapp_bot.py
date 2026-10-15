@@ -320,10 +320,25 @@ def parse_numbot_menu(welcome_message: str) -> dict:
 # Menu Senders  (async with REPLY_DELAY)
 # =============================================================================
 
-async def _send(client: NewClient, jid: JID, text: str) -> None:
-    """Send a message after REPLY_DELAY seconds (non-blocking async sleep)."""
+# ── Watermark ────────────────────────────────────────────────────────────
+# Lives in code only (never stored in customers' message texts in the DB).
+# Keep this identical to WATERMARK_TEXT in auto_reply_bot.py.
+WATERMARK_TEXT = "Powered by AutoChat  ⚡ https://bit.ly/4B58hs3"
+
+
+def apply_watermark(text: str, watermark_on: bool = True) -> str:
+    """Append the watermark to the end of a reply when watermark_on is True."""
+    if not watermark_on:
+        return text
+    return f"{text.rstrip()}\n\n{WATERMARK_TEXT}"
+
+
+async def _send(client: NewClient, jid: JID, text: str, watermark: bool = True) -> None:
+    """Send a message after REPLY_DELAY seconds (non-blocking async sleep).
+    Single choke point for EVERY outgoing reply (welcome + all menu
+    sections), so the watermark is applied here and nowhere else."""
     await asyncio.sleep(REPLY_DELAY)
-    client.send_message(jid, text)
+    client.send_message(jid, apply_watermark(text, watermark))
 
 
 async def send_main_menu(client: NewClient, jid: JID, menu_data: dict) -> None:
@@ -333,7 +348,7 @@ async def send_main_menu(client: NewClient, jid: JID, menu_data: dict) -> None:
         if k in menu_data['main_menu']:
             text += f"{k}️⃣ {menu_data['main_menu'][k]}\n"
     text += '\n📌 Choose a number to continue'
-    await _send(client, jid, text)
+    await _send(client, jid, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_1(client: NewClient, jid: JID, menu_data: dict) -> None:
@@ -346,7 +361,7 @@ async def send_section_1(client: NewClient, jid: JID, menu_data: dict) -> None:
         if menu_data['main_menu'].get(k):
             text += f"{k} → {menu_data['main_menu'][k]}\n"
     text += "0 → Back to Main Menu\n"
-    await _send(client, jid, text)
+    await _send(client, jid, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_2(client: NewClient, jid: JID, menu_data: dict) -> None:
@@ -359,7 +374,7 @@ async def send_section_2(client: NewClient, jid: JID, menu_data: dict) -> None:
         if menu_data['main_menu'].get(k):
             text += f"{k} → {menu_data['main_menu'][k]}\n"
     text += "0 → Back to Main Menu\n"
-    await _send(client, jid, text)
+    await _send(client, jid, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_3(client: NewClient, jid: JID, menu_data: dict) -> None:
@@ -372,7 +387,7 @@ async def send_section_3(client: NewClient, jid: JID, menu_data: dict) -> None:
     if menu_data['main_menu'].get('4'):
         text += f"📋 Options:\n4 → {menu_data['main_menu']['4']}\n"
     text += "0 → Back to Main Menu\n"
-    await _send(client, jid, text)
+    await _send(client, jid, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_4(client: NewClient, jid: JID, menu_data: dict) -> None:
@@ -382,7 +397,7 @@ async def send_section_4(client: NewClient, jid: JID, menu_data: dict) -> None:
     if not body:
         body = "🕐 Please wait, someone is going to contact you soon..."
     text = f"4️⃣ {name}:\n\n{body}\n\n📋 Options:\n0 → Back to Main Menu\n"
-    await _send(client, jid, text)
+    await _send(client, jid, text, watermark=menu_data.get('watermark', True))
 
 
 # =============================================================================
@@ -436,7 +451,7 @@ async def handle_message_async(client: NewClient, msg: MessageEv,
     try:
         result = (
             supabase.table('telegram_bot')
-            .select('id, welcome_message, bot_type, status')
+            .select('id, welcome_message, bot_type, status, watermark')
             .eq('id', bot_id)
             .limit(1)
             .execute()
@@ -452,16 +467,20 @@ async def handle_message_async(client: NewClient, msg: MessageEv,
     if row.get('status') != 'active':
         return
 
+    # watermark: TRUE (or missing/NULL) -> append; only an explicit FALSE
+    # in the DB turns it off (flip it manually after a customer upgrades).
+    watermark_on    = row.get('watermark') is not False
     bot_type        = row.get('bot_type', 'welcome_bot')
     welcome_message = row.get('welcome_message', '')
 
     # ── 3. Welcome Bot ────────────────────────────────────────────────────────
     if bot_type == 'welcome_bot':
-        await _send(client, reply_jid, welcome_message)
+        await _send(client, reply_jid, welcome_message, watermark=watermark_on)
         return
 
     # ── 4. Number Bot ─────────────────────────────────────────────────────────
     menu_data = parse_numbot_menu(welcome_message)
+    menu_data['watermark'] = watermark_on
     state     = user_states[bot_id].get(sender_id, 'main')
 
     # ── Navigation map: digit → (state_name, sender_function) ──────────────────
