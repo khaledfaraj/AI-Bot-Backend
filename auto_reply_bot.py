@@ -63,9 +63,24 @@ _registry_lock  = threading.Lock()
 # ============================================
 # Helper: send with delay
 # ============================================
-async def send_delayed(event, text, delay=REPLY_DELAY):
+# ── Watermark ────────────────────────────────────────────────────────────
+# Lives in code only (never stored in customers' message texts in the DB).
+# Keep this identical to WATERMARK_TEXT in whatsapp_bot.py.
+WATERMARK_TEXT = "Powered by AutoChat  ⚡ https://bit.ly/4B58hs3"
+
+
+def apply_watermark(text: str, watermark_on: bool = True) -> str:
+    """Append the watermark to the end of a reply when watermark_on is True."""
+    if not watermark_on:
+        return text
+    return f"{text.rstrip()}\n\n{WATERMARK_TEXT}"
+
+
+async def send_delayed(event, text, delay=REPLY_DELAY, watermark=True):
+    # Single choke point for EVERY outgoing reply (welcome + all menu
+    # sections), so the watermark is applied here and nowhere else.
     await asyncio.sleep(delay)
-    await event.respond(text)
+    await event.respond(apply_watermark(text, watermark))
 
 
 # ============================================
@@ -165,7 +180,7 @@ async def send_main_menu(event, menu_data):
         if k in menu_data['main_menu']:
             text += f"{k}️⃣ {menu_data['main_menu'][k]}\n"
     text += '\n📌 Choose a number to continue'
-    await send_delayed(event, text)
+    await send_delayed(event, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_1(event, menu_data):
@@ -178,7 +193,7 @@ async def send_section_1(event, menu_data):
         if menu_data['main_menu'].get(k):
             text += f"{k} → {menu_data['main_menu'][k]}\n"
     text += "0 → Back to Main Menu\n"
-    await send_delayed(event, text)
+    await send_delayed(event, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_2(event, menu_data):
@@ -191,7 +206,7 @@ async def send_section_2(event, menu_data):
         if menu_data['main_menu'].get(k):
             text += f"{k} → {menu_data['main_menu'][k]}\n"
     text += "0 → Back to Main Menu\n"
-    await send_delayed(event, text)
+    await send_delayed(event, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_3(event, menu_data):
@@ -203,7 +218,7 @@ async def send_section_3(event, menu_data):
     if menu_data['main_menu'].get('4'):
         text += f"📋 Options:\n4 → {menu_data['main_menu']['4']}\n"
     text += "0 → Back to Main Menu\n"
-    await send_delayed(event, text)
+    await send_delayed(event, text, watermark=menu_data.get('watermark', True))
 
 
 async def send_section_4(event, menu_data):
@@ -212,7 +227,7 @@ async def send_section_4(event, menu_data):
     if not body:
         body = "🕐 Please wait, someone is going to contact you soon..."
     text  = f"4️⃣ {name}:\n\n{body}\n\n📋 Options:\n0 → Back to Main Menu\n"
-    await send_delayed(event, text)
+    await send_delayed(event, text, watermark=menu_data.get('watermark', True))
 
 
 # ============================================
@@ -296,7 +311,7 @@ def make_handler(bot_record):
         try:
             result = await asyncio.to_thread(
                 lambda: supabase.table('telegram_bot')
-                    .select('id, welcome_message, bot_type, status')
+                    .select('id, welcome_message, bot_type, status, watermark')
                     .eq('id', bot_id)
                     .limit(1)
                     .execute()
@@ -314,6 +329,9 @@ def make_handler(bot_record):
             print(f"[Bot {phone}] ⏸️ Bot is no longer active")
             return
 
+        # watermark: TRUE (or missing/NULL) -> append; only an explicit FALSE
+        # in the DB turns it off (flip it manually after a customer upgrades).
+        watermark_on    = row.get('watermark') is not False
         bot_type        = row.get('bot_type', 'welcome_bot')
         welcome_message = row.get('welcome_message', '')
         state           = user_states[bot_id].get(sender_id, 'main')
@@ -322,11 +340,12 @@ def make_handler(bot_record):
 
         # ── WELCOME BOT ─────────────────────────────────────────────
         if bot_type == 'welcome_bot':
-            await send_delayed(event, welcome_message)
+            await send_delayed(event, welcome_message, watermark=watermark_on)
             return
 
         # ── NUMBER BOT — Universal Navigation (identical to WhatsApp) ──
         menu_data = parse_numbot_menu(welcome_message)
+        menu_data['watermark'] = watermark_on
 
         _sections = {
             '1': ('section_1', send_section_1),
