@@ -5,11 +5,13 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import re
+import time
 from datetime import datetime, timezone
 
 import threading
 
 from session_crypto import decrypt_text_safe
+import ai_engine
 
 load_dotenv()
 
@@ -311,7 +313,7 @@ def make_handler(bot_record):
         try:
             result = await asyncio.to_thread(
                 lambda: supabase.table('telegram_bot')
-                    .select('id, welcome_message, bot_type, status, watermark')
+                    .select('id, welcome_message, bot_type, status, watermark, gemini_api_key, ai_role, ai_tone, ai_human_contact, ai_memory_enabled')
                     .eq('id', bot_id)
                     .limit(1)
                     .execute()
@@ -337,6 +339,30 @@ def make_handler(bot_record):
         state           = user_states[bot_id].get(sender_id, 'main')
 
         print(f"[Bot {phone}] 📋 Type: {bot_type} | State: {state}")
+
+        # ── AI BOT (Gemini, customer's own key) ─────────────────────
+        # Must come before the welcome/number-bot logic: anything that is not
+        # 'welcome_bot' falls through to the number-bot menu below.
+        if bot_type == 'ai_bot':
+            started = time.monotonic()
+            reply = await ai_engine.generate_reply(
+                bot_id         = bot_id,
+                sender_id      = sender_id,
+                user_text      = msg_text,
+                encrypted_key  = row.get('gemini_api_key'),
+                company_info   = welcome_message,
+                role           = row.get('ai_role'),
+                tone           = row.get('ai_tone'),
+                human_contact  = row.get('ai_human_contact') or '',
+                memory_enabled = row.get('ai_memory_enabled') is not False,
+            )
+            if reply is None:       # empty/media-only message, or sender over the rate limit
+                return
+            # Gemini already took a moment — only wait out the REMAINING part of
+            # the usual human-like delay instead of stacking a full extra one.
+            remaining = max(0.0, REPLY_DELAY - (time.monotonic() - started))
+            await send_delayed(event, reply, delay=remaining, watermark=watermark_on)
+            return
 
         # ── WELCOME BOT ─────────────────────────────────────────────
         if bot_type == 'welcome_bot':
