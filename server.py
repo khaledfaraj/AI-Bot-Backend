@@ -11,7 +11,7 @@ WhatsApp Architecture:
   │  • Runs client.connect() in a background thread                    │
   │  • QR arrives via @client.qr callback → broadcast to SSE queue    │
   └────────────────────────────────────────────────────────────────────┘
-  ┌─ GET  /api/whatsapp/qr-stream?userId=…  (SSE) ─────────────────────┐
+  ┌─ GET  /api/whatsapp/qr-stream?token=…  (SSE) ─────────────────────┐
   │  • Streams QR Base64 PNG to the browser in real-time               │
   │  • Sends "connected" event after successful scan                   │
   └────────────────────────────────────────────────────────────────────┘
@@ -57,6 +57,7 @@ from neonize.proto.Neonize_pb2 import JID
 # both are explicitly launched from this file's startup() event below.
 import auto_reply_bot
 import whatsapp_bot
+import ai_engine
 
 load_dotenv()
 
@@ -482,50 +483,78 @@ def get_current_user(request: Request) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AI bot helpers (Gemini, bring-your-own-key)
+# ─────────────────────────────────────────────────────────────────────────────
+ALLOWED_BOT_TYPES = ('welcome_bot', 'number_bot', 'ai_bot')
+MAX_GEMINI_KEY_LEN = 200
+
+
+def _clean_bot_type(value) -> str:
+    bot_type = value or 'welcome_bot'
+    if bot_type not in ALLOWED_BOT_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid botType")
+    return bot_type
+
+
+def _ai_columns_for_create(body: dict, bot_type: str, company_info: str) -> dict:
+    """
+    AI-related columns to store when a bot is created. Validates BEFORE any
+    side effects (Telegram login, WhatsApp client, DB rows) so a bad form
+    never leaves half-created state behind.
+
+    For non-AI bot types any previously saved Gemini key is cleared, so a
+    customer's key never lingers on a bot that doesn't use it.
+    """
+    if bot_type != 'ai_bot':
+        return {'gemini_api_key': None}
+
+    api_key = (body.get('geminiApiKey') or '').strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="A Gemini API key is required for an AI bot")
+    if len(api_key) > MAX_GEMINI_KEY_LEN:
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid Gemini API key")
+
+    info = (company_info or '').strip()
+    if not info:
+        raise HTTPException(status_code=400, detail="Company information is required for an AI bot")
+    if len(info) > ai_engine.MAX_COMPANY_INFO_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Company information is too long (max {ai_engine.MAX_COMPANY_INFO_CHARS} characters)")
+
+    return {
+        'gemini_api_key':    encrypt_text(api_key),     # never stored in plaintext
+        'ai_role':           ai_engine.normalize_role(body.get('aiRole')),
+        'ai_tone':           ai_engine.normalize_tone(body.get('aiTone')),
+        'ai_human_contact':  (body.get('aiHumanContact') or '').strip()[:ai_engine.MAX_HUMAN_CONTACT_CHARS],
+        'ai_memory_enabled': body.get('aiMemoryEnabled') is not False,
+    }
+
+
+# Simple per-user limiter for the "test my key" endpoints, so they can't be
+# used as a free request-forwarder to Google.
+_ai_test_calls: dict = {}
+_AI_TEST_LIMIT, _AI_TEST_WINDOW = 10, 60
+
+
+def _check_ai_test_limit(user_id: str) -> None:
+    import time as _time
+    now = _time.monotonic()
+    stamps = [t for t in _ai_test_calls.get(user_id, []) if now - t < _AI_TEST_WINDOW]
+    if len(stamps) >= _AI_TEST_LIMIT:
+        _ai_test_calls[user_id] = stamps
+        raise HTTPException(status_code=429, detail="Too many key tests — please wait a minute")
+    stamps.append(now)
+    _ai_test_calls[user_id] = stamps
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 🗑 Soft Delete Bot — UNCHANGED
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/delete-bot")
-async def delete_bot(request: Request):
-    try:
-        body    = await request.json()
-        bot_id  = body.get('botId')
-        user_id = body.get('userId')
-
-        if not bot_id or not user_id:
-            raise HTTPException(status_code=400, detail="botId and userId are required")
-        if not supabase:
-            raise HTTPException(status_code=500, detail="Database not connected")
-
-        check = (
-            supabase.table('telegram_bot')
-            .select('id')
-            .eq('id', bot_id)
-            .eq('user_id', user_id)
-            .execute()
-        )
-        if not check.data:
-            raise HTTPException(status_code=404, detail="Bot not found or access denied")
-
-        # Hard delete: remove the row completely from the database
-        supabase.table('telegram_bot').delete().eq('id', bot_id).execute()
-
-        # Also tear down any running neonize client for this user
-        if user_id in wa_clients:
-            try:
-                wa_clients[user_id].stop()
-            except Exception:
-                pass
-            del wa_clients[user_id]
-
-        print(f"✅ [DELETE-BOT] Hard-deleted bot {bot_id} for user {user_id}")
-        return {'success': True, 'message': 'Bot deleted successfully'}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ [DELETE-BOT ERROR]: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# REMOVED: the old unauthenticated /api/delete-bot. It trusted a client-supplied
+# `userId` with no signature check, so anyone could delete anyone's bot. The
+# frontend uses the protected DELETE /api/bots/{bot_id} further down instead.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,8 +564,8 @@ async def delete_bot(request: Request):
 def _create_neonize_client(user_id: str, bot_row_id: str,
                             welcome_message: str, tmp_dir: str) -> NewClient:
     """
-    Build a neonize NewClient wired up with QR, Connected, and Message
-    event handlers. The session file lives in tmp_dir/whatsapp_session.sqlite3.
+    Build a neonize NewClient wired up with QR and Connected handlers
+    (pairing only — see the note above about replies). The session file lives in tmp_dir/whatsapp_session.sqlite3.
     """
     db_path = os.path.join(tmp_dir, "whatsapp_session.sqlite3")
     session_name = db_path  # neonize accepts a file path as session name
@@ -571,34 +600,12 @@ def _create_neonize_client(user_id: str, bot_row_id: str,
             print(f"⚠️  [WA] Could not save phone number: {e}")
         _broadcast_to_user(user_id, "CONNECTED")
 
-    # ── Message handler ──────────────────────────────────────────────────────
-    @client.event(MessageEv)
-    def on_message(_c: NewClient, msg: MessageEv) -> None:
-        try:
-            src = msg.Info.MessageSource
-
-            # Only handle private (non-group) messages
-            if src.IsGroup:
-                return
-            # Ignore own messages
-            if src.IsFromMe:
-                return
-
-            text = _extract_text(msg)
-            sender_user = src.Sender.User
-            print(f"💬 [WA] Message from {sender_user}: {text!r}")
-
-            if not text:
-                return
-
-            # Reply with the bot's welcome message
-            reply_jid = _build_reply_jid(msg)
-            if reply_jid and welcome_message:
-                client.send_message(reply_jid, welcome_message)
-                print(f"✅ [WA] Replied to {sender_user}")
-
-        except Exception as e:
-            print(f"❌ [WA] Message handler error: {e}")
+    # ── No message handler on purpose ───────────────────────────────────────
+    # This client exists only to pair the phone (QR scan) and save the session.
+    # It used to auto-reply with the raw welcome_message, which bypassed the
+    # watermark, the number-bot menus and the AI bot — and could double-reply
+    # alongside the real bot manager (whatsapp_bot.py). Replies are now sent
+    # ONLY by whatsapp_bot.py once the bot is active.
 
     return client
 
@@ -612,12 +619,14 @@ def _run_neonize(client: NewClient) -> None:
 
 
 @app.post("/api/whatsapp/connect")
-async def whatsapp_connect(request: Request):
+async def whatsapp_connect(request: Request, current_user: dict = Depends(get_current_user)):
     """
     Initialise a neonize WhatsApp client for the user.
 
     Body (JSON):
-      userId, botName, botType, welcomeMessage,
+      botName, botType, welcomeMessage,
+      (AI bots also: geminiApiKey, aiRole, aiTone, aiHumanContact, aiMemoryEnabled)
+      (userId is NOT read from the body — it comes from the signed token)
       menuStructure, products, products2, products3, waitingMessage
 
     Flow:
@@ -628,9 +637,10 @@ async def whatsapp_connect(request: Request):
     """
     try:
         body            = await request.json()
-        user_id         = body.get('userId', '').strip()
+        # FIX: never trust a client-supplied userId — use the verified id.
+        user_id         = current_user['id']
         bot_name        = body.get('botName', 'MyWhatsAppBot')
-        bot_type        = body.get('botType', 'welcome_bot')
+        bot_type        = _clean_bot_type(body.get('botType'))
         welcome_message = body.get('welcomeMessage', '')
         menu_structure  = body.get('menuStructure', {})
         products        = body.get('products', [])
@@ -653,6 +663,8 @@ async def whatsapp_connect(request: Request):
         else:
             formatted_message = welcome_message
 
+        ai_cols = _ai_columns_for_create(body, bot_type, welcome_message)
+
         if not supabase:
             raise HTTPException(status_code=500, detail="Database not connected")
 
@@ -672,7 +684,7 @@ async def whatsapp_connect(request: Request):
             saved_session = existing.data[0].get('Send Code', '')
             print(f"[WA] Reusing existing bot row {bot_row_id}")
         else:
-            insert_result = supabase.table('telegram_bot').insert([{
+            new_row = {
                 'user_id':         user_id,
                 'bot_name':        bot_name,
                 'bot_type':        bot_type,
@@ -685,16 +697,21 @@ async def whatsapp_connect(request: Request):
                 'status':          'pending',
                 'created_at':      datetime.now().isoformat(),
                 'updated_at':      datetime.now().isoformat()
-            }]).execute()
+            }
+            new_row.update(ai_cols)
+            insert_result = supabase.table('telegram_bot').insert([new_row]).execute()
             bot_row_id   = insert_result.data[0]['id']
             saved_session = ''
             print(f"[WA] Created new bot row {bot_row_id}")
 
-        # Update welcome message in case it changed
-        supabase.table('telegram_bot').update({
+        # Update welcome message (and bot type / AI settings) in case they changed
+        row_update = {
             'welcome_message': formatted_message,
+            'bot_type':        bot_type,
             'updated_at':      datetime.now().isoformat()
-        }).eq('id', bot_row_id).execute()
+        }
+        row_update.update(ai_cols)
+        supabase.table('telegram_bot').update(row_update).eq('id', bot_row_id).execute()
 
         # ── Step 2: Stop previous client for this user (if any) ─────────────
         if user_id in wa_clients:
@@ -728,8 +745,8 @@ async def whatsapp_connect(request: Request):
         return {
             "success":  True,
             "botRowId": bot_row_id,
-            "message":  "WhatsApp client started. Connect to /api/whatsapp/qr-stream to get the QR code.",
-            "qrStream": f"/api/whatsapp/qr-stream?userId={user_id}"
+            "message":  "WhatsApp client started. Connect to /api/whatsapp/qr-stream (with ?token=<authToken>) to get the QR code.",
+            "qrStream": "/api/whatsapp/qr-stream"
         }
 
     except HTTPException:
@@ -740,9 +757,15 @@ async def whatsapp_connect(request: Request):
 
 
 @app.get("/api/whatsapp/qr-stream")
-async def whatsapp_qr_stream(userId: str = Query(...)):
+async def whatsapp_qr_stream(token: str = Query(...)):
     """
     SSE endpoint — streams events to the browser for a specific user.
+
+    FIX: this used to take `userId` as a query param and trust it, so anyone
+    who knew/guessed another user's id could watch (or race to scan) their
+    WhatsApp QR code. Browsers' EventSource can't send an Authorization
+    header, so the signed session token is passed as ?token= and verified
+    here; the user id is derived from it, never trusted raw.
 
     Event types sent:
       • event: status   data: waiting          ← first ping (connection OK)
@@ -750,8 +773,10 @@ async def whatsapp_qr_stream(userId: str = Query(...)):
       • event: connected data: success         ← scan successful
       • event: heartbeat data: ping            ← keepalive every 20 s
     """
-    if not userId:
-        raise HTTPException(status_code=400, detail="userId is required")
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired session — please log in again")
+    userId = payload['id']
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -803,9 +828,10 @@ async def whatsapp_qr_stream(userId: str = Query(...)):
 
 
 @app.get("/api/whatsapp/status")
-async def whatsapp_status(userId: str = Query(...)):
-    """Returns the current connection status for a user's WhatsApp bot."""
-    client = wa_clients.get(userId)
+async def whatsapp_status(current_user: dict = Depends(get_current_user)):
+    """Returns the current connection status for the caller's WhatsApp bot.
+    (userId now comes from the verified token, not a query param.)"""
+    client = wa_clients.get(current_user['id'])
     if client is None:
         return {"connected": False, "status": "not_initialized"}
     try:
@@ -825,7 +851,7 @@ async def whatsapp_status(userId: str = Query(...)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/send-code")
-async def send_code(request: Request):
+async def send_code(request: Request, current_user: dict = Depends(get_current_user)):
     try:
         body = await request.json()
         print("\n" + "="*60)
@@ -834,9 +860,10 @@ async def send_code(request: Request):
         phone_number    = body.get('phoneNumber')
         api_id          = body.get('apiId')
         api_hash        = body.get('apiHash')
-        user_id         = body.get('userId')
+        # FIX: never trust a client-supplied userId — use the verified id.
+        user_id         = current_user['id']
         bot_name        = body.get('botName', 'MyBot')
-        bot_type        = body.get('botType', 'welcome_bot')
+        bot_type        = _clean_bot_type(body.get('botType'))
         welcome_message = body.get('welcomeMessage', '')
         menu_structure  = body.get('menuStructure', {})
         products        = body.get('products', [])
@@ -859,6 +886,9 @@ async def send_code(request: Request):
             })
         else:
             formatted_message = welcome_message
+
+        # Validate the AI settings BEFORE connecting to Telegram / sending a code.
+        ai_cols = _ai_columns_for_create(body, bot_type, welcome_message)
 
         session = StringSession('')
         tg_client = TelegramClient(session, api_id, api_hash)
@@ -886,7 +916,7 @@ async def send_code(request: Request):
                     .execute()
                 )
                 if existing.data:
-                    supabase.table('telegram_bot').update({
+                    row_update = {
                         'bot_name':        bot_name,
                         'bot_type':        bot_type,
                         'welcome_message': formatted_message,
@@ -895,10 +925,12 @@ async def send_code(request: Request):
                         'Send Code':       '',
                         'status':          'pending',
                         'updated_at':      datetime.now().isoformat()
-                    }).eq('id', existing.data[0]['id']).execute()
+                    }
+                    row_update.update(ai_cols)
+                    supabase.table('telegram_bot').update(row_update).eq('id', existing.data[0]['id']).execute()
                     print("✅ [TELEGRAM] Updated existing Supabase row\n")
                 else:
-                    supabase.table('telegram_bot').insert([{
+                    new_row = {
                         'user_id':         user_id,
                         'bot_name':        bot_name,
                         'bot_type':        bot_type,
@@ -911,28 +943,45 @@ async def send_code(request: Request):
                         'status':          'pending',
                         'created_at':      datetime.now().isoformat(),
                         'updated_at':      datetime.now().isoformat()
-                    }]).execute()
+                    }
+                    new_row.update(ai_cols)
+                    supabase.table('telegram_bot').insert([new_row]).execute()
                     print("✅ [TELEGRAM] Inserted new Supabase row\n")
             except Exception as db_error:
+                # Used to be swallowed (the flow then "succeeded" with no bot row
+                # saved and failed later, confusingly). Fail now, and clean up the
+                # half-open Telegram login so it doesn't leak.
                 print(f"\n❌ DATABASE ERROR: {db_error}")
+                active_sessions.pop(session_id, None)
+                try:
+                    await tg_client.disconnect()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail="Could not save the bot — please try again")
         return {'success': True, 'sessionId': session_id, 'message': 'Code sent successfully'}
+    except HTTPException:
+        raise      # keep the real status code (400/404...) instead of turning it into a 500
     except Exception as error:
         print(f"\n❌ ERROR: {str(error)}")
         raise HTTPException(status_code=500, detail=str(error))
 
 
 @app.post("/api/verify-code")
-async def verify_code(request: Request):
+async def verify_code(request: Request, current_user: dict = Depends(get_current_user)):
     try:
         body = await request.json()
         session_id = body.get('sessionId')
         code       = body.get('code')
-        user_id    = body.get('userId')
+        # FIX: verified id from the token, not a client-supplied userId.
+        user_id    = current_user['id']
 
         if not session_id or not code:
             raise HTTPException(status_code=400, detail="Missing sessionId or code")
         session_data = active_sessions.get(session_id)
         if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found or expired")
+        # The pending login must belong to the caller (session ids are guessable-ish).
+        if session_data.get('user_id') != user_id:
             raise HTTPException(status_code=404, detail="Session not found or expired")
 
         tg_client       = session_data['client']
@@ -965,26 +1014,16 @@ async def verify_code(request: Request):
         await tg_client.disconnect()
         del active_sessions[session_id]
         return {'success': True, 'sessionString': session_string}
+    except HTTPException:
+        raise      # keep the real status code (400/404...) instead of turning it into a 500
     except Exception as error:
         print(f"\n❌ ERROR: {str(error)}")
         raise HTTPException(status_code=500, detail=str(error))
 
 
-@app.post("/api/activate-bot")
-async def activate_bot(request: dict):
-    try:
-        user_id  = request.get('userId')
-        bot_name = request.get('botName')
-        if not user_id or not bot_name:
-            raise HTTPException(status_code=400, detail="Missing userId or botName")
-        if supabase:
-            supabase.table('telegram_bot').update({
-                'status': 'active', 'updated_at': datetime.now().isoformat()
-            }).eq('user_id', user_id).eq('bot_name', bot_name).execute()
-        return {'success': True, 'message': f'Bot "{bot_name}" is now active!'}
-    except Exception as error:
-        print(f"❌ Activate error: {error}")
-        raise HTTPException(status_code=500, detail=str(error))
+# REMOVED: the old unauthenticated /api/activate-bot (trusted a client-supplied
+# userId, unused by the frontend). Superseded by the protected
+# /api/bots/activate-pending and /api/bots/{bot_id}/activate below.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1009,15 +1048,25 @@ def _get_owned_bot(bot_id: str, user_id: str) -> dict:
 async def list_bots(current_user: dict = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database not connected")
+    # Explicit column list instead of select('*'): the browser must never
+    # receive the stored Telegram/WhatsApp session ("Send Code"), "API Hash"
+    # or the customer's Gemini key. We only tell it WHETHER a key is saved.
     result = (
         supabase.table('telegram_bot')
-        .select('*')
+        .select('id, bot_name, bot_type, platform, welcome_message, status, watermark, '
+                'created_at, updated_at, ai_role, ai_tone, ai_human_contact, '
+                'ai_memory_enabled, gemini_api_key')
         .eq('user_id', current_user['id'])
         .not_.is_('bot_name', 'null')
         .order('created_at', desc=True)
         .execute()
     )
-    return {'bots': result.data}
+    bots = []
+    for row in result.data:
+        row = dict(row)
+        row['has_gemini_key'] = bool(row.pop('gemini_api_key', None))
+        bots.append(row)
+    return {'bots': bots}
 
 
 @app.post("/api/bots/{bot_id}/toggle")
@@ -1037,6 +1086,10 @@ async def update_welcome_message(bot_id: str, request: Request, current_user: di
     message = (body.get('welcome_message') or '').strip()
     if not message:
         raise HTTPException(status_code=400, detail="welcome_message is required")
+    if len(message) > ai_engine.MAX_COMPANY_INFO_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"welcome_message is too long (max {ai_engine.MAX_COMPANY_INFO_CHARS} characters)")
     _get_owned_bot(bot_id, current_user['id'])
     supabase.table('telegram_bot').update({
         'welcome_message': message,
@@ -1100,6 +1153,94 @@ async def activate_bot(bot_id: str, request: Request, current_user: dict = Depen
 async def delete_bot(bot_id: str, current_user: dict = Depends(get_current_user)):
     _get_owned_bot(bot_id, current_user['id'])
     supabase.table('telegram_bot').delete().eq('id', bot_id).execute()
+
+    # Tear down any neonize client still held for this user.
+    user_id = current_user['id']
+    if user_id in wa_clients:
+        try:
+            wa_clients[user_id].stop()
+        except Exception:
+            pass
+        del wa_clients[user_id]
+
+    return {'success': True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🤖 AI bot endpoints (Gemini, bring-your-own-key)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/ai/test-key")
+async def ai_test_key(request: Request, current_user: dict = Depends(get_current_user)):
+    """Body: {"api_key": "..."} → {"ok": bool, "code": str}. Used by the 'Test key'
+    button in the create-bot form, BEFORE anything is saved. The key is only
+    forwarded to Google for this one call; it is never stored or logged."""
+    _check_ai_test_limit(current_user['id'])
+    body = await request.json()
+    api_key = (body.get('api_key') or '').strip()
+    return await ai_engine.test_api_key(api_key)
+
+
+@app.post("/api/bots/{bot_id}/ai-test")
+async def ai_test_saved_key(bot_id: str, current_user: dict = Depends(get_current_user)):
+    """Tests the key already saved on one of the caller's AI bots."""
+    _check_ai_test_limit(current_user['id'])
+    bot = _get_owned_bot(bot_id, current_user['id'])
+    if bot.get('bot_type') != 'ai_bot':
+        raise HTTPException(status_code=400, detail="This bot is not an AI bot")
+    key = ai_engine._resolve_key(bot.get('gemini_api_key'))
+    if not key:
+        return {'ok': False, 'code': 'no_key'}
+    return await ai_engine.test_api_key(key)
+
+
+@app.post("/api/bots/{bot_id}/ai-settings")
+async def update_ai_settings(bot_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Partial update of an AI bot's settings — only the fields present in the body
+    change. Body keys (all optional): gemini_api_key, company_info, ai_role,
+    ai_tone, ai_human_contact, ai_memory_enabled.
+
+    An empty/missing gemini_api_key KEEPS the saved key (the browser never
+    receives it, so it can't send it back); a non-empty one replaces it.
+    """
+    bot = _get_owned_bot(bot_id, current_user['id'])
+    if bot.get('bot_type') != 'ai_bot':
+        raise HTTPException(status_code=400, detail="This bot is not an AI bot")
+
+    body = await request.json()
+    update: dict = {}
+
+    key = (body.get('gemini_api_key') or '').strip()
+    if key:
+        if len(key) > MAX_GEMINI_KEY_LEN:
+            raise HTTPException(status_code=400, detail="That doesn't look like a valid Gemini API key")
+        update['gemini_api_key'] = encrypt_text(key)
+
+    if 'company_info' in body:
+        info = (body.get('company_info') or '').strip()
+        if not info:
+            raise HTTPException(status_code=400, detail="Company information can't be empty")
+        if len(info) > ai_engine.MAX_COMPANY_INFO_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Company information is too long (max {ai_engine.MAX_COMPANY_INFO_CHARS} characters)")
+        update['welcome_message'] = info
+
+    if 'ai_role' in body:
+        update['ai_role'] = ai_engine.normalize_role(body.get('ai_role'))
+    if 'ai_tone' in body:
+        update['ai_tone'] = ai_engine.normalize_tone(body.get('ai_tone'))
+    if 'ai_human_contact' in body:
+        update['ai_human_contact'] = (body.get('ai_human_contact') or '').strip()[:ai_engine.MAX_HUMAN_CONTACT_CHARS]
+    if 'ai_memory_enabled' in body:
+        update['ai_memory_enabled'] = body.get('ai_memory_enabled') is not False
+
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    update['updated_at'] = datetime.now().isoformat()
+    supabase.table('telegram_bot').update(update).eq('id', bot_id).execute()
     return {'success': True}
 
 
